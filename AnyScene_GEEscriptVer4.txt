@@ -1,0 +1,1336 @@
+/**** Any Scene Comparison Tool
+ * Adds:
+ * - P1/P2 Cloud Fill Window: Off, ±15, ±30, ±45 days
+ * - Resource cap for scene stacks
+ * - Monthly compositing preserved
+ * - Compare tools only activate when P1/P2 use same analytic product
+ ****/
+
+
+// =====================================================
+// DRAWING TOOLS SETUP
+// =====================================================
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(true);
+drawingTools.setLinked(false);
+drawingTools.setDrawModes(['rectangle', 'polygon']);
+
+function resetDrawingLayer() {
+  while (drawingTools.layers().length() > 0) {
+    drawingTools.layers().remove(drawingTools.layers().get(0));
+  }
+
+  drawingTools.layers().add(ui.Map.GeometryLayer({
+    geometries: [],
+    name: 'AOI',
+    color: 'FF0000'
+  }));
+}
+resetDrawingLayer();
+
+
+// =====================================================
+// USER SETTINGS
+// =====================================================
+var MIN_YEAR = 1982;
+var CURRENT_YEAR = new Date().getFullYear();
+var EXPORT_SCALE = 30;
+var MAX_SCENES_PER_COMPOSITE = 24;
+
+var p1Product = 'MNDWI';
+var p2Product = 'MNDWI';
+
+var p1Year = 2024;
+var p2Year = 2024;
+
+var p1Month = 8;
+var p2Month = 8;
+
+var p1CloudMax = 35;
+var p2CloudMax = 35;
+
+var p1CompositeMethod = 'Median monthly composite';
+var p2CompositeMethod = 'Median monthly composite';
+
+var p1FillDays = 0;
+var p2FillDays = 0;
+
+var activeRoi = null;
+var p1Scene = null;
+var p2Scene = null;
+
+
+// =====================================================
+// UI OPTION LISTS
+// =====================================================
+var MONTH_OPTIONS = [
+  '01 - January', '02 - February', '03 - March', '04 - April',
+  '05 - May', '06 - June', '07 - July', '08 - August',
+  '09 - September', '10 - October', '11 - November', '12 - December'
+];
+
+var CLOUD_OPTIONS = ['<10%', '<35%', '<50%', '<85%'];
+
+var COMPOSITE_METHOD_OPTIONS = [
+  'Median monthly composite',
+  'Closest-date gap fill',
+  'Least-cloudy mosaic'
+];
+
+var CLOUD_FILL_OPTIONS = [
+  'Off',
+  '±15 days',
+  '±30 days',
+  '±45 days'
+];
+
+var FALLBACK_CLOUDS = [10, 35, 50, 85];
+
+function monthFromLabel(label) {
+  return parseInt(label.substring(0, 2), 10);
+}
+
+function monthName(monthNumber) {
+  return MONTH_OPTIONS[monthNumber - 1].substring(5);
+}
+
+function cloudFromLabel(label) {
+  return parseInt(label.replace('<', '').replace('%', ''), 10);
+}
+
+function fillDaysFromLabel(label) {
+  if (label === '±15 days') return 15;
+  if (label === '±30 days') return 30;
+  if (label === '±45 days') return 45;
+  return 0;
+}
+
+function twoDigit(n) {
+  return n < 10 ? '0' + n : '' + n;
+}
+
+
+// =====================================================
+// PRODUCT CONFIG
+// =====================================================
+var PRODUCT_OPTIONS = [
+  'MNDWI',
+  'EVI',
+  'BSI',
+  'NDMI',
+  'NDBI',
+  'NDSI',
+  'True Color',
+  'False Color Infrared',
+  'Thermal',
+  'UV-Proxy (Coastal Aerosol)',
+  'Shallow Water Composite',
+  'Relative Bathymetry',
+  'Blue-Green Log Contrast'
+];
+
+var ANALYTIC_PRODUCTS = ['MNDWI', 'EVI', 'BSI', 'NDMI', 'NDBI', 'NDSI'];
+
+var PRODUCT_VIS = {
+  MNDWI: {min: -0.5, max: 0.8, palette: ['8b4513', 'f5f5dc', '87ceeb', '0000ff']},
+  EVI:   {min: -1.0, max: 1.0, palette: ['8b4513', 'f5f5dc', '90ee90', '006400']},
+  BSI:   {min: -1.0, max: 1.0, palette: ['0000ff', 'f5f5dc', '8b4513']},
+  NDMI:  {min: -1.0, max: 1.0, palette: ['8b4513', 'f5f5dc', '87ceeb', '0000ff']},
+  NDBI:  {min: -1.0, max: 1.0, palette: ['0000ff', 'f5f5dc', 'ff8c00', 'ff0000']},
+  NDSI:  {min: -1.0, max: 1.0, palette: ['2c3e50', '87ceeb', 'f5f5dc', 'ffffff']},
+
+  'True Color': {bands: ['RED', 'GREEN', 'BLUE'], min: 0.0, max: 0.3},
+  'False Color Infrared': {bands: ['NIR', 'RED', 'GREEN'], min: 0.0, max: 0.4},
+  'Thermal': {min: 0, max: 40, palette: ['0000ff', '00ffff', 'ffff00', 'ff7f00', 'ff0000']},
+  'UV-Proxy (Coastal Aerosol)': {min: 0.0, max: 0.3, palette: ['000000', '4b0082', '0000ff', '00ffff', 'ffffff']},
+  'Shallow Water Composite': {bands: ['COASTAL', 'BLUE', 'GREEN'], min: 0.0, max: 0.25},
+  'Relative Bathymetry': {min: 0.7, max: 1.5, palette: ['000000', '0000ff', '00ffff', 'ffff00', 'ffffff']},
+  'Blue-Green Log Contrast': {min: -1.0, max: 1.0, palette: ['4b0082', '0000ff', '00ffff', 'ffffcc', 'ffffff']}
+};
+
+var FEATURE_CONFIG = {
+  MNDWI: {label: 'Water', thresholdMode: 'otsu', threshold: null, compare: 'gt'},
+  EVI:   {label: 'Vegetation', thresholdMode: 'fixed', threshold: 0.20, compare: 'gt'},
+  BSI:   {label: 'Bare Soil', thresholdMode: 'fixed', threshold: 0.00, compare: 'gt'},
+  NDMI:  {label: 'Moisture', thresholdMode: 'fixed', threshold: 0.10, compare: 'gt'},
+  NDBI:  {label: 'Built-up', thresholdMode: 'fixed', threshold: 0.00, compare: 'gt'},
+  NDSI:  {label: 'Snow/Ice', thresholdMode: 'fixed', threshold: 0.40, compare: 'gt'}
+};
+
+var LEGEND_CONFIG = {
+  MNDWI: {subtitle: 'Wetness / open water tendency', type: 'scalar', leftLabel: '-0.5 land/dry', centerLabel: '0.15 transition', rightLabel: '0.8 water/wet'},
+  EVI:   {subtitle: 'Vegetation vigor', type: 'scalar', leftLabel: '-1 non-veg', centerLabel: '0.2 threshold', rightLabel: '1 strong veg'},
+  BSI:   {subtitle: 'Bare soil tendency', type: 'scalar', leftLabel: '-1 less bare', centerLabel: '0 threshold', rightLabel: '1 more bare'},
+  NDMI:  {subtitle: 'Moisture tendency', type: 'scalar', leftLabel: '-1 drier', centerLabel: '0.1 threshold', rightLabel: '1 wetter'},
+  NDBI:  {subtitle: 'Built-up tendency', type: 'scalar', leftLabel: '-1 less built', centerLabel: '0 threshold', rightLabel: '1 built-up'},
+  NDSI:  {subtitle: 'Snow / ice tendency', type: 'scalar', leftLabel: '-1 non-snow', centerLabel: '0.4 threshold', rightLabel: '1 snow/ice'},
+  'Thermal': {subtitle: 'Surface temperature', type: 'thermal', leftLabel: '0°C / 32°F', centerLabel: '20°C / 68°F', rightLabel: '40°C / 104°F'},
+  'UV-Proxy (Coastal Aerosol)': {subtitle: 'Coastal aerosol reflectance proxy', type: 'scalar', leftLabel: '0 low', centerLabel: '0.15 mid', rightLabel: '0.30 high'},
+  'Relative Bathymetry': {subtitle: 'log(BLUE) / log(GREEN)', type: 'scalar', leftLabel: '0.7 low', centerLabel: '1.1 mid', rightLabel: '1.5 high'},
+  'Blue-Green Log Contrast': {subtitle: 'log(BLUE) - log(GREEN)', type: 'scalar', leftLabel: '-1 green-dom.', centerLabel: '0 neutral', rightLabel: '1 blue-dom.'},
+  'True Color': {subtitle: 'RGB composite', type: 'rgb', message: 'No scalar legend. RGB display.'},
+  'False Color Infrared': {subtitle: 'NIR-RED-GREEN composite', type: 'rgb', message: 'No scalar legend. RGB display.'},
+  'Shallow Water Composite': {subtitle: 'Coastal-Blue-Green composite', type: 'rgb', message: 'Exploratory shallow-water RGB composite.'}
+};
+
+function isAnalyticProduct(productName) {
+  return ANALYTIC_PRODUCTS.indexOf(productName) > -1;
+}
+
+function canCompareProducts() {
+  return p1Product === p2Product && isAnalyticProduct(p1Product);
+}
+
+function sharedCompareProduct() {
+  return canCompareProducts() ? p1Product : null;
+}
+
+
+// =====================================================
+// LANDSAT SCALING + QA MASK
+// =====================================================
+function applyScaleFactors(image) {
+  var optical = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  return image.addBands(optical, null, true);
+}
+
+function maskLandsatC2L2(image) {
+  var qa = image.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)
+    .and(qa.bitwiseAnd(1 << 1).eq(0))
+    .and(qa.bitwiseAnd(1 << 2).eq(0))
+    .and(qa.bitwiseAnd(1 << 3).eq(0))
+    .and(qa.bitwiseAnd(1 << 4).eq(0))
+    .and(qa.bitwiseAnd(1 << 5).eq(0));
+
+  return image.updateMask(mask);
+}
+
+
+// =====================================================
+// BAND HARMONIZATION
+// =====================================================
+function maskedBand(name, roi) {
+  return ee.Image.constant(0)
+    .toFloat()
+    .rename(name)
+    .clip(roi)
+    .updateMask(ee.Image.constant(0));
+}
+
+function selectCoreBands(image, sensor, roi) {
+  var core = ee.Image(ee.Algorithms.If(
+    ee.String(sensor).compareTo('L8L9').eq(0),
+    image.select(
+      ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6'],
+      ['BLUE',  'GREEN', 'RED',   'NIR',   'SWIR1']
+    ),
+    image.select(
+      ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5'],
+      ['BLUE',  'GREEN', 'RED',   'NIR',   'SWIR1']
+    )
+  )).toFloat();
+
+  var coastal = ee.Image(ee.Algorithms.If(
+    ee.String(sensor).compareTo('L8L9').eq(0),
+    image.select('SR_B1').rename('COASTAL').toFloat(),
+    maskedBand('COASTAL', roi)
+  ));
+
+  var thermal = ee.Image(ee.Algorithms.If(
+    ee.String(sensor).compareTo('L8L9').eq(0),
+    image.select('ST_B10')
+      .multiply(0.00341802)
+      .add(149.0)
+      .subtract(273.15)
+      .rename('THERMAL')
+      .toFloat(),
+    maskedBand('THERMAL', roi)
+  ));
+
+  return core.addBands(coastal).addBands(thermal);
+}
+
+
+// =====================================================
+// ADD PRODUCTS
+// =====================================================
+function addProducts(image) {
+  var mndwi = image.normalizedDifference(['GREEN', 'SWIR1']).rename('MNDWI');
+  var ndmi  = image.normalizedDifference(['NIR', 'SWIR1']).rename('NDMI');
+  var ndbi  = image.normalizedDifference(['SWIR1', 'NIR']).rename('NDBI');
+  var ndsi  = image.normalizedDifference(['GREEN', 'SWIR1']).rename('NDSI');
+
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+    {NIR: image.select('NIR'), RED: image.select('RED'), BLUE: image.select('BLUE')}
+  ).rename('EVI');
+
+  var bsi = image.expression(
+    '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))',
+    {SWIR1: image.select('SWIR1'), RED: image.select('RED'), NIR: image.select('NIR'), BLUE: image.select('BLUE')}
+  ).rename('BSI');
+
+  var blueSafe = image.select('BLUE').max(ee.Image.constant(0.0001));
+  var greenSafe = image.select('GREEN').max(ee.Image.constant(0.0001));
+  var blueLog = blueSafe.multiply(1000).log();
+  var greenLog = greenSafe.multiply(1000).log();
+
+  var relBathy = blueLog.divide(greenLog).rename('REL_BATHY');
+  var bgLogContrast = blueLog.subtract(greenLog).rename('BG_LOG_CONTRAST');
+
+  return image.addBands([
+    mndwi, evi, bsi, ndmi, ndbi, ndsi,
+    relBathy, bgLogContrast
+  ]);
+}
+
+
+// =====================================================
+// OTSU THRESHOLD
+// =====================================================
+function getOtsuThreshold(indexImage, region, scale, bandName) {
+  var rr = indexImage.reduceRegion({
+    reducer: ee.Reducer.histogram({maxBuckets: 256}),
+    geometry: region,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e13
+  });
+
+  return ee.Number(ee.Algorithms.If(
+    rr.contains(bandName),
+    otsu(rr.get(bandName)),
+    0.0
+  ));
+}
+
+function otsu(histDict) {
+  histDict = ee.Dictionary(histDict);
+  var counts = ee.Array(histDict.get('histogram'));
+  var means  = ee.Array(histDict.get('bucketMeans'));
+  var size   = ee.Number(means.length().get([0]));
+  var fallback = ee.Number(0.0);
+
+  return ee.Number(ee.Algorithms.If(size.lt(2), fallback, (function() {
+    var total = ee.Number(counts.reduce(ee.Reducer.sum(), [0]).get([0]));
+
+    return ee.Number(ee.Algorithms.If(total.eq(0), fallback, (function() {
+      var sum = ee.Number(means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]));
+      var meanTotal = sum.divide(total);
+      var indices = ee.List.sequence(1, size.subtract(1));
+
+      var scored = indices.map(function(i) {
+        i = ee.Number(i);
+        var counts1 = counts.slice(0, 0, i);
+        var counts2 = counts.slice(0, i, size);
+        var sum1 = ee.Number(counts1.reduce(ee.Reducer.sum(), [0]).get([0]));
+        var sum2 = ee.Number(counts2.reduce(ee.Reducer.sum(), [0]).get([0]));
+
+        var bcv = ee.Number(ee.Algorithms.If(
+          sum1.eq(0).or(sum2.eq(0)),
+          -1,
+          (function() {
+            var w1 = sum1.divide(total);
+            var w2 = sum2.divide(total);
+
+            var mean1 = ee.Number(
+              means.slice(0, 0, i).multiply(counts1).reduce(ee.Reducer.sum(), [0]).get([0])
+            ).divide(sum1);
+
+            var mean2 = ee.Number(
+              means.slice(0, i, size).multiply(counts2).reduce(ee.Reducer.sum(), [0]).get([0])
+            ).divide(sum2);
+
+            return w1.multiply(mean1.subtract(meanTotal).pow(2))
+              .add(w2.multiply(mean2.subtract(meanTotal).pow(2)));
+          })()
+        ));
+
+        return ee.Feature(null, {bcv: bcv, idx: i});
+      });
+
+      var best = ee.Dictionary(ee.FeatureCollection(scored).sort('bcv', false).first().toDictionary());
+      var bestBCV = ee.Number(best.get('bcv'));
+
+      return ee.Number(ee.Algorithms.If(
+        bestBCV.lt(0),
+        fallback,
+        ee.Number(means.get([ee.Number(best.get('idx'))]))
+      ));
+    })()));
+  })()));
+}
+
+
+// =====================================================
+// AOI + VALIDATION
+// =====================================================
+function getDrawnAoi() {
+  if (drawingTools.layers().length() === 0) return null;
+  var layer = drawingTools.layers().get(0);
+  var geoms = layer.geometries();
+  if (geoms.length() === 0) return null;
+  return ee.Geometry(geoms.get(0));
+}
+
+function parseYearInput(textValue) {
+  var y = parseInt(textValue, 10);
+  if (isNaN(y)) return null;
+  if (y < MIN_YEAR || y > CURRENT_YEAR) return null;
+  return y;
+}
+
+
+// =====================================================
+// COLLECTION BUILDER
+// =====================================================
+function landsatCollection(start, end, roi, cloudMax, targetDate) {
+  function addSceneMetrics(img) {
+    var dateDistance = ee.Number(img.date().difference(targetDate, 'day')).abs();
+    return img.set('dateDistance', dateDistance);
+  }
+
+  function prep(collectionId, sensor) {
+    return ee.ImageCollection(collectionId)
+      .filterBounds(roi)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUD_COVER', cloudMax))
+      .map(addSceneMetrics)
+      .map(applyScaleFactors)
+      .map(maskLandsatC2L2)
+      .map(function(img){ return selectCoreBands(img, sensor, roi); })
+      .map(addProducts);
+  }
+
+  var merged = prep('LANDSAT/LT04/C02/T1_L2', 'L57')
+    .merge(prep('LANDSAT/LT05/C02/T1_L2', 'L57'))
+    .merge(prep('LANDSAT/LE07/C02/T1_L2', 'L57'))
+    .merge(prep('LANDSAT/LC08/C02/T1_L2', 'L8L9'))
+    .merge(prep('LANDSAT/LC09/C02/T1_L2', 'L8L9'));
+
+  return merged.sort('dateDistance').limit(MAX_SCENES_PER_COMPOSITE);
+}
+
+
+// =====================================================
+// SCENE BUILDER
+// =====================================================
+function emptySceneImage(roi) {
+  return ee.Image.constant([
+    0,0,0,0,0,0,0,
+    -999,-999,-999,-999,-999,-999,-999,-999
+  ]).rename([
+    'BLUE','GREEN','RED','NIR','SWIR1','COASTAL','THERMAL',
+    'MNDWI','EVI','BSI','NDMI','NDBI','NDSI','REL_BATHY','BG_LOG_CONTRAST'
+  ]).toFloat().updateMask(ee.Image.constant(0)).clip(roi);
+}
+
+function compositeCollection(collection, method) {
+  if (method === 'Closest-date gap fill') {
+    return collection.sort('dateDistance', false).mosaic();
+  }
+
+  if (method === 'Least-cloudy mosaic') {
+    return collection.sort('CLOUD_COVER', false).mosaic();
+  }
+
+  return collection.median();
+}
+
+function buildScene(year, month, cloudMax, compositeMethod, fillDays, roi) {
+  var monthStart = ee.Date.fromYMD(year, month, 1);
+  var monthEnd = monthStart.advance(1, 'month');
+  var target = monthStart.advance(14, 'day');
+
+  var start = monthStart.advance(-fillDays, 'day');
+  var end = monthEnd.advance(fillDays, 'day');
+
+  var cloudsToTry = FALLBACK_CLOUDS.filter(function(c) {
+    return c >= cloudMax;
+  });
+
+  var candidates = [];
+  var order = 0;
+
+  cloudsToTry.forEach(function(cMax) {
+    var col = landsatCollection(start, end, roi, cMax, target);
+
+    candidates.push(ee.Feature(null, {
+      order: order,
+      cloudMax: cMax,
+      startMillis: start.millis(),
+      endMillis: end.millis(),
+      targetMillis: target.millis(),
+      nImages: col.size()
+    }));
+
+    order++;
+  });
+
+  var candidateFC = ee.FeatureCollection(candidates);
+  var valid = candidateFC.filter(ee.Filter.gt('nImages', 0));
+
+  var chosen = ee.Feature(ee.Algorithms.If(
+    valid.size().gt(0),
+    valid.sort('order').first(),
+    candidateFC.sort('order').first()
+  ));
+
+  var startFinal = ee.Date(ee.Number(chosen.get('startMillis')));
+  var endFinal = ee.Date(ee.Number(chosen.get('endMillis')));
+  var targetFinal = ee.Date(ee.Number(chosen.get('targetMillis')));
+  var cloudFinal = ee.Number(chosen.get('cloudMax'));
+
+  var finalCollection = landsatCollection(startFinal, endFinal, roi, cloudFinal, targetFinal);
+  var nFinal = finalCollection.size();
+
+  var composite = ee.Image(ee.Algorithms.If(
+    nFinal.gt(0),
+    compositeCollection(finalCollection.select([
+      'BLUE','GREEN','RED','NIR','SWIR1','COASTAL','THERMAL',
+      'MNDWI','EVI','BSI','NDMI','NDBI','NDSI','REL_BATHY','BG_LOG_CONTRAST'
+    ]), compositeMethod).clip(roi),
+    emptySceneImage(roi)
+  ));
+
+  return {
+    year: year,
+    month: month,
+    monthLabel: monthName(month),
+    requestedCloudMax: cloudMax,
+    cloudMax: cloudFinal,
+    requestedCompositeMethod: compositeMethod,
+    fillDays: fillDays,
+    start: startFinal,
+    end: endFinal,
+    nImages: nFinal,
+    composite: composite
+  };
+}
+
+
+// =====================================================
+// PRODUCT HELPERS
+// =====================================================
+function getFeatureLabel(productName) {
+  return FEATURE_CONFIG[productName].label;
+}
+
+function getThresholdDescription(productName) {
+  if (!isAnalyticProduct(productName)) return '';
+  var cfg = FEATURE_CONFIG[productName];
+
+  if (cfg.thresholdMode === 'otsu') {
+    return 'Threshold: Otsu, scene-dependent';
+  }
+
+  return 'Threshold: ' + productName + ' ' + cfg.compare + ' ' + cfg.threshold;
+}
+
+function getSelectedView(scene, productName) {
+  var img = scene.composite;
+
+  if (productName === 'True Color') return {image: img.select(['RED', 'GREEN', 'BLUE']), vis: PRODUCT_VIS[productName]};
+  if (productName === 'False Color Infrared') return {image: img.select(['NIR', 'RED', 'GREEN']), vis: PRODUCT_VIS[productName]};
+  if (productName === 'Thermal') return {image: img.select('THERMAL').rename('THERMAL'), vis: PRODUCT_VIS[productName]};
+  if (productName === 'UV-Proxy (Coastal Aerosol)') return {image: img.select('COASTAL').rename('COASTAL'), vis: PRODUCT_VIS[productName]};
+  if (productName === 'Shallow Water Composite') return {image: img.select(['COASTAL', 'BLUE', 'GREEN']), vis: PRODUCT_VIS[productName]};
+  if (productName === 'Relative Bathymetry') return {image: img.select('REL_BATHY').rename('REL_BATHY'), vis: PRODUCT_VIS[productName]};
+  if (productName === 'Blue-Green Log Contrast') return {image: img.select('BG_LOG_CONTRAST').rename('BG_LOG_CONTRAST'), vis: PRODUCT_VIS[productName]};
+
+  return {image: img.select(productName).rename(productName), vis: PRODUCT_VIS[productName]};
+}
+
+function getSelectedDerived(scene, roi, productName) {
+  var cfg = FEATURE_CONFIG[productName];
+  var indexImage = scene.composite.select(productName).rename(productName);
+
+  var threshold = ee.Number(ee.Algorithms.If(
+    ee.String(cfg.thresholdMode).compareTo('otsu').eq(0),
+    getOtsuThreshold(indexImage, roi, EXPORT_SCALE, productName),
+    cfg.threshold
+  ));
+
+  var featureMask = ee.Image(ee.Algorithms.If(
+    ee.String(cfg.compare).compareTo('lt').eq(0),
+    indexImage.lt(threshold),
+    indexImage.gt(threshold)
+  )).rename('FEATURE').selfMask();
+
+  return {
+    indexImage: indexImage,
+    threshold: threshold,
+    featureMask: featureMask,
+    label: cfg.label
+  };
+}
+
+
+// =====================================================
+// MAP LAYERS
+// =====================================================
+var layerAOI = ui.Map.Layer(ee.Geometry.Point([0, 0]), {}, 'AOI', false);
+var layerP1Main = ui.Map.Layer(ee.Image(), PRODUCT_VIS[p1Product], 'P1 ' + p1Product, false);
+var layerP2Main = ui.Map.Layer(ee.Image(), PRODUCT_VIS[p2Product], 'P2 ' + p2Product, true);
+var layerP1Feature = ui.Map.Layer(ee.Image(), {palette:['00FFFF']}, 'P1 Feature', false);
+var layerP2Feature = ui.Map.Layer(ee.Image(), {palette:['FFFF00']}, 'P2 Feature', false);
+var layerGain = ui.Map.Layer(ee.Image(), {palette:['00FFFF']}, 'Gain', false);
+var layerLoss = ui.Map.Layer(ee.Image(), {palette:['FF00FF']}, 'Loss', false);
+var layerNet = ui.Map.Layer(ee.Image(), {min:-1, max:1, palette:['FF00FF','000000','00FFFF']}, 'Net Change (-1/0/+1)', false);
+var layerDelta = ui.Map.Layer(ee.Image(), {min:-0.5, max:0.5, palette:['FF00FF','000000','00FFFF']}, 'Analytic Delta (P2 - P1)', false);
+
+Map.layers().reset([
+  layerP1Main, layerP2Main,
+  layerP1Feature, layerP2Feature,
+  layerGain, layerLoss, layerNet, layerDelta,
+  layerAOI
+]);
+
+layerP1Main.setOpacity(1.0);
+layerP2Main.setOpacity(0.7);
+
+
+// =====================================================
+// LEGENDS
+// =====================================================
+function makeLegendPanel(titleText) {
+  var panel = ui.Panel({
+    style: {padding: '6px 8px', margin: '0 0 6px 0', backgroundColor: 'rgba(255,255,255,0.9)'}
+  });
+
+  var title = ui.Label(titleText, {fontWeight:'bold', fontSize:'12px', margin:'0 0 2px 0'});
+  var subtitle = ui.Label('', {fontSize:'11px', color:'#555', margin:'0 0 4px 0'});
+
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select('longitude'),
+    params: {bbox: [0, 0, 1, 0.1], dimensions: '240x16', format: 'png', min: 0, max: 1, palette: ['000000', 'ffffff']},
+    style: {stretch: 'horizontal', margin: '0 6px', maxHeight: '22px'}
+  });
+
+  var labels = ui.Panel({layout: ui.Panel.Layout.flow('horizontal'), style: {stretch:'horizontal', margin:'2px 0 0 0'}});
+  var note = ui.Label('', {fontSize:'10px', color:'#333', margin:'4px 0 0 0', whiteSpace:'pre-wrap'});
+
+  panel.add(title);
+  panel.add(subtitle);
+  panel.add(colorBar);
+  panel.add(labels);
+  panel.add(note);
+
+  return {panel: panel, subtitle: subtitle, colorBar: colorBar, labels: labels, note: note};
+}
+
+function buildLegendLabels(panelObj, left, center, right) {
+  panelObj.labels.clear();
+  panelObj.labels.add(ui.Label(left, {margin:'0', fontSize:'10px', stretch:'horizontal', textAlign:'left'}));
+  panelObj.labels.add(ui.Label(center, {margin:'0', fontSize:'10px', stretch:'horizontal', textAlign:'center'}));
+  panelObj.labels.add(ui.Label(right, {margin:'0', fontSize:'10px', stretch:'horizontal', textAlign:'right'}));
+}
+
+function updateLegendPanel(panelObj, productName) {
+  var cfg = LEGEND_CONFIG[productName];
+  panelObj.subtitle.setValue(cfg.subtitle);
+
+  if (cfg.type === 'rgb') {
+    panelObj.colorBar.style().set('shown', false);
+    panelObj.labels.style().set('shown', false);
+    panelObj.note.setValue(cfg.message);
+    return;
+  }
+
+  panelObj.colorBar.style().set('shown', true);
+  panelObj.labels.style().set('shown', true);
+
+  panelObj.colorBar.setParams({
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '240x16',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: PRODUCT_VIS[productName].palette
+  });
+
+  buildLegendLabels(panelObj, cfg.leftLabel, cfg.centerLabel, cfg.rightLabel);
+
+  if (cfg.type === 'thermal') {
+    panelObj.note.setValue('Thermal shown in °C; labels also include °F.');
+  } else if (isAnalyticProduct(productName)) {
+    panelObj.note.setValue(getThresholdDescription(productName));
+  } else if (productName === 'Relative Bathymetry' || productName === 'Blue-Green Log Contrast') {
+    panelObj.note.setValue('Exploratory shallow-water enhancement. Best in clear, shallow water.');
+  } else {
+    panelObj.note.setValue('');
+  }
+}
+
+var legendsContainer = ui.Panel({style: {position: 'bottom-left', width: '290px', padding: '6px'}});
+var p1Legend = makeLegendPanel('Period 1');
+var p2Legend = makeLegendPanel('Period 2');
+legendsContainer.add(p1Legend.panel);
+legendsContainer.add(p2Legend.panel);
+Map.add(legendsContainer);
+
+function updateLegends() {
+  updateLegendPanel(p1Legend, p1Product);
+  updateLegendPanel(p2Legend, p2Product);
+}
+
+
+// =====================================================
+// LABELS / STATE
+// =====================================================
+function sceneText(scene) {
+  var fillText = scene.fillDays === 0 ? 'Fill Off' : 'Fill ±' + scene.fillDays + 'd';
+  return scene.monthLabel + ' ' + scene.year +
+    ' | Cloud <' + scene.requestedCloudMax + '%' +
+    ' | ' + scene.requestedCompositeMethod +
+    ' | ' + fillText;
+}
+
+function setCompareLayersEmpty() {
+  var empty = ee.Image.constant(0).updateMask(ee.Image.constant(0));
+  layerP1Feature.setEeObject(empty);
+  layerP2Feature.setEeObject(empty);
+  layerGain.setEeObject(empty);
+  layerLoss.setEeObject(empty);
+  layerNet.setEeObject(empty);
+  layerDelta.setEeObject(empty);
+}
+
+function updateControlState() {
+  var comparable = canCompareProducts();
+  statsBtn.setDisabled(!comparable);
+  compareExportSelect.setDisabled(!comparable);
+  compareExportBtn.setDisabled(!comparable);
+  csvBtn.setDisabled(!comparable);
+
+  if (comparable) {
+    modeLabel.setValue('Mode: comparable. Same analytic product selected for P1 and P2.');
+  } else {
+    modeLabel.setValue('Mode: independent overlay. Change tools disabled until P1 and P2 match on an analytic product.');
+  }
+}
+
+function rebuildIfReady() {
+  if (activeRoi && p1Scene && p2Scene) {
+    buildSelectedScenes();
+  } else {
+    statusLabel.setValue('Settings changed. Draw AOI and click Build / Refresh Selected Scenes.');
+  }
+}
+
+
+// =====================================================
+// BUILD / UPDATE
+// =====================================================
+function buildSelectedScenes() {
+  activeRoi = getDrawnAoi();
+
+  if (!activeRoi) {
+    statusLabel.setValue('Draw one rectangle or polygon first.');
+    return;
+  }
+
+  var y1 = parseYearInput(p1YearBox.getValue());
+  var y2 = parseYearInput(p2YearBox.getValue());
+
+  if (y1 === null || y2 === null) {
+    statusLabel.setValue('Invalid year. Use years from ' + MIN_YEAR + ' to ' + CURRENT_YEAR + '.');
+    return;
+  }
+
+  p1Year = y1;
+  p2Year = y2;
+
+  p1Month = monthFromLabel(p1MonthSelect.getValue());
+  p2Month = monthFromLabel(p2MonthSelect.getValue());
+
+  p1CloudMax = cloudFromLabel(p1CloudSelect.getValue());
+  p2CloudMax = cloudFromLabel(p2CloudSelect.getValue());
+
+  p1CompositeMethod = p1CompositeSelect.getValue();
+  p2CompositeMethod = p2CompositeSelect.getValue();
+
+  p1FillDays = fillDaysFromLabel(p1FillSelect.getValue());
+  p2FillDays = fillDaysFromLabel(p2FillSelect.getValue());
+
+  statusLabel.setValue('Building selected scenes...');
+
+  p1Scene = buildScene(p1Year, p1Month, p1CloudMax, p1CompositeMethod, p1FillDays, activeRoi);
+  p2Scene = buildScene(p2Year, p2Month, p2CloudMax, p2CompositeMethod, p2FillDays, activeRoi);
+
+  layerAOI.setEeObject(activeRoi);
+  layerAOI.setShown(true);
+
+  Map.centerObject(activeRoi, 9);
+
+  updateControlState();
+  updateLegends();
+  updateComparison();
+
+  statusLabel.setValue('Scenes built. Toggle layers in the Layers panel.');
+
+  p1Scene.nImages.evaluate(function(n) {
+    if (n === 0) p1Info.setValue('P1: no images found. Try higher cloud threshold, fill window, or nearby month.');
+  });
+
+  p2Scene.nImages.evaluate(function(n) {
+    if (n === 0) p2Info.setValue('P2: no images found. Try higher cloud threshold, fill window, or nearby month.');
+  });
+}
+
+function updateComparison() {
+  if (!activeRoi || !p1Scene || !p2Scene) {
+    p1Info.setValue('No P1 scene built yet.');
+    p2Info.setValue('No P2 scene built yet.');
+    diffInfo.setValue('Draw AOI and click Build / Refresh Selected Scenes.');
+    return;
+  }
+
+  var v1 = getSelectedView(p1Scene, p1Product);
+  var v2 = getSelectedView(p2Scene, p2Product);
+
+  layerP1Main.setName('P1 ' + p1Product + ' | ' + sceneText(p1Scene));
+  layerP2Main.setName('P2 ' + p2Product + ' | ' + sceneText(p2Scene));
+
+  layerP1Main.setEeObject(v1.image);
+  layerP1Main.setVisParams(v1.vis);
+
+  layerP2Main.setEeObject(v2.image);
+  layerP2Main.setVisParams(v2.vis);
+
+  p1Info.setValue('P1: ' + sceneText(p1Scene) + ' | Product: ' + p1Product + ' | nImages: (server)');
+  p2Info.setValue('P2: ' + sceneText(p2Scene) + ' | Product: ' + p2Product + ' | nImages: (server)');
+
+  if (!canCompareProducts()) {
+    layerP1Feature.setName('P1 Feature (disabled)');
+    layerP2Feature.setName('P2 Feature (disabled)');
+    layerGain.setName('Gain (disabled)');
+    layerLoss.setName('Loss (disabled)');
+    layerNet.setName('Net Change (disabled)');
+    layerDelta.setName('Analytic Delta (disabled)');
+    setCompareLayersEmpty();
+    diffInfo.setValue('Independent overlay mode. Compare tools require P1 and P2 to use the same analytic product.');
+    return;
+  }
+
+  var compareProduct = sharedCompareProduct();
+  var d1 = getSelectedDerived(p1Scene, activeRoi, compareProduct);
+  var d2 = getSelectedDerived(p2Scene, activeRoi, compareProduct);
+  var featureLabel = getFeatureLabel(compareProduct);
+
+  var p1f = d1.featureMask.unmask(0);
+  var p2f = d2.featureMask.unmask(0);
+
+  layerP1Feature.setName('P1 ' + featureLabel + ' Feature');
+  layerP2Feature.setName('P2 ' + featureLabel + ' Feature');
+  layerGain.setName(featureLabel + ' Gain');
+  layerLoss.setName(featureLabel + ' Loss');
+  layerNet.setName('Net ' + featureLabel + ' Change');
+  layerDelta.setName(compareProduct + ' Delta');
+
+  layerP1Feature.setEeObject(d1.featureMask);
+  layerP2Feature.setEeObject(d2.featureMask);
+  layerGain.setEeObject(p2f.and(p1f.not()).rename('GAIN').selfMask());
+  layerLoss.setEeObject(p1f.and(p2f.not()).rename('LOSS').selfMask());
+  layerNet.setEeObject(p2f.subtract(p1f).rename('NET'));
+  layerDelta.setEeObject(d2.indexImage.subtract(d1.indexImage).rename('DELTA'));
+
+  diffInfo.setValue('Comparable mode active. Shared analytic product: ' + compareProduct + '.');
+}
+
+
+// =====================================================
+// STATS
+// =====================================================
+function computeAreaKm2(featureMask, roi) {
+  return ee.Number(
+    featureMask.multiply(ee.Image.pixelArea()).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: EXPORT_SCALE,
+      bestEffort: true,
+      maxPixels: 1e13
+    }).get('FEATURE')
+  ).divide(1e6);
+}
+
+function refreshStats() {
+  if (!canCompareProducts()) {
+    diffInfo.setValue('Stats require P1 and P2 to use the same analytic product.');
+    return;
+  }
+
+  if (!activeRoi || !p1Scene || !p2Scene) {
+    diffInfo.setValue('Build scenes first.');
+    return;
+  }
+
+  var compareProduct = sharedCompareProduct();
+  var featureLabel = getFeatureLabel(compareProduct);
+  var d1 = getSelectedDerived(p1Scene, activeRoi, compareProduct);
+  var d2 = getSelectedDerived(p2Scene, activeRoi, compareProduct);
+
+  var a1 = computeAreaKm2(d1.featureMask, activeRoi);
+  var a2 = computeAreaKm2(d2.featureMask, activeRoi);
+
+  var p1f = d1.featureMask.unmask(0);
+  var p2f = d2.featureMask.unmask(0);
+
+  var gainKm2 = computeAreaKm2(p2f.and(p1f.not()).rename('FEATURE').selfMask(), activeRoi);
+  var lossKm2 = computeAreaKm2(p1f.and(p2f.not()).rename('FEATURE').selfMask(), activeRoi);
+
+  p1Scene.nImages.evaluate(function(n1) {
+    d1.threshold.evaluate(function(t1) {
+      a1.evaluate(function(area1) {
+        p1Info.setValue(
+          'P1: ' + sceneText(p1Scene) +
+          ' | Product: ' + p1Product +
+          ' | nImages: ' + n1 +
+          ' | threshold: ' + (t1 !== null ? t1.toFixed(4) : 'NA') +
+          ' | ' + featureLabel + '_km2: ' + (area1 !== null ? area1.toFixed(2) : 'NA')
+        );
+      });
+    });
+  });
+
+  p2Scene.nImages.evaluate(function(n2) {
+    d2.threshold.evaluate(function(t2) {
+      a2.evaluate(function(area2) {
+        p2Info.setValue(
+          'P2: ' + sceneText(p2Scene) +
+          ' | Product: ' + p2Product +
+          ' | nImages: ' + n2 +
+          ' | threshold: ' + (t2 !== null ? t2.toFixed(4) : 'NA') +
+          ' | ' + featureLabel + '_km2: ' + (area2 !== null ? area2.toFixed(2) : 'NA')
+        );
+      });
+    });
+  });
+
+  gainKm2.evaluate(function(g) {
+    lossKm2.evaluate(function(l) {
+      diffInfo.setValue(
+        'Shared product: ' + compareProduct +
+        ' | Gain_km2: ' + (g !== null ? g.toFixed(2) : 'NA') +
+        ' | Loss_km2: ' + (l !== null ? l.toFixed(2) : 'NA')
+      );
+    });
+  });
+}
+
+
+// =====================================================
+// EXPORTS
+// =====================================================
+function exportRaster(periodWhich) {
+  if (!activeRoi || !p1Scene || !p2Scene) {
+    throw new Error('Build scenes first.');
+  }
+
+  var img, desc;
+
+  if (periodWhich === 'P1 Selected Product') {
+    img = getSelectedView(p1Scene, p1Product).image;
+    desc = 'SCENE_P1_' + p1Product.replace(/[^A-Za-z0-9]+/g, '_') +
+      '_' + p1Year + '_' + twoDigit(p1Month) +
+      '_cloudlt' + p1CloudMax + '_fill' + p1FillDays;
+
+  } else if (periodWhich === 'P2 Selected Product') {
+    img = getSelectedView(p2Scene, p2Product).image;
+    desc = 'SCENE_P2_' + p2Product.replace(/[^A-Za-z0-9]+/g, '_') +
+      '_' + p2Year + '_' + twoDigit(p2Month) +
+      '_cloudlt' + p2CloudMax + '_fill' + p2FillDays;
+
+  } else {
+    throw new Error('Unknown raster export target.');
+  }
+
+  Export.image.toDrive({
+    image: img.clip(activeRoi),
+    description: desc,
+    folder: 'GEE_Exports',
+    fileNamePrefix: desc,
+    region: activeRoi,
+    scale: EXPORT_SCALE,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+
+  print('Raster export task created:', desc);
+}
+
+function exportCompare(which) {
+  if (!canCompareProducts()) throw new Error('Compare exports require same analytic product.');
+  if (!activeRoi || !p1Scene || !p2Scene) throw new Error('Build scenes first.');
+
+  var compareProduct = sharedCompareProduct();
+  var featureLabel = getFeatureLabel(compareProduct);
+  var d1 = getSelectedDerived(p1Scene, activeRoi, compareProduct);
+  var d2 = getSelectedDerived(p2Scene, activeRoi, compareProduct);
+  var p1f = d1.featureMask.unmask(0);
+  var p2f = d2.featureMask.unmask(0);
+
+  var img, desc;
+
+  if (which === 'Selected Analytic Delta (P2 - P1)') {
+    img = d2.indexImage.subtract(d1.indexImage).rename('DELTA');
+    desc = 'SCENE_' + compareProduct + '_DELTA_' + p1Year + '_' + twoDigit(p1Month) + '_vs_' + p2Year + '_' + twoDigit(p2Month);
+  } else if (which === 'Selected Feature Gain') {
+    img = p2f.and(p1f.not()).rename('GAIN').selfMask();
+    desc = 'SCENE_' + compareProduct + '_GAIN_' + p1Year + '_' + twoDigit(p1Month) + '_vs_' + p2Year + '_' + twoDigit(p2Month);
+  } else if (which === 'Selected Feature Loss') {
+    img = p1f.and(p2f.not()).rename('LOSS').selfMask();
+    desc = 'SCENE_' + compareProduct + '_LOSS_' + p1Year + '_' + twoDigit(p1Month) + '_vs_' + p2Year + '_' + twoDigit(p2Month);
+  } else if (which === 'Selected Feature Net (-1/0/+1)') {
+    img = p2f.subtract(p1f).rename('NET');
+    desc = 'SCENE_' + compareProduct + '_NET_' + p1Year + '_' + twoDigit(p1Month) + '_vs_' + p2Year + '_' + twoDigit(p2Month);
+  } else if (which === 'P1 Selected Feature') {
+    img = d1.featureMask.rename('FEATURE').selfMask();
+    desc = 'SCENE_P1_' + compareProduct + '_' + featureLabel.replace(/[^A-Za-z0-9]+/g, '_') + '_' + p1Year + '_' + twoDigit(p1Month);
+  } else if (which === 'P2 Selected Feature') {
+    img = d2.featureMask.rename('FEATURE').selfMask();
+    desc = 'SCENE_P2_' + compareProduct + '_' + featureLabel.replace(/[^A-Za-z0-9]+/g, '_') + '_' + p2Year + '_' + twoDigit(p2Month);
+  } else {
+    throw new Error('Unknown compare export target.');
+  }
+
+  Export.image.toDrive({
+    image: img.clip(activeRoi),
+    description: desc,
+    folder: 'GEE_Exports',
+    fileNamePrefix: desc,
+    region: activeRoi,
+    scale: EXPORT_SCALE,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+
+  print('Compare export task created:', desc);
+}
+
+function exportCompareSummaryCSV() {
+  if (!canCompareProducts()) throw new Error('CSV export requires same analytic product.');
+
+  var compareProduct = sharedCompareProduct();
+  var featureLabel = getFeatureLabel(compareProduct);
+  var d1 = getSelectedDerived(p1Scene, activeRoi, compareProduct);
+  var d2 = getSelectedDerived(p2Scene, activeRoi, compareProduct);
+  var a1 = computeAreaKm2(d1.featureMask, activeRoi);
+  var a2 = computeAreaKm2(d2.featureMask, activeRoi);
+
+  Export.table.toDrive({
+    collection: ee.FeatureCollection([
+      ee.Feature(null, {
+        period: 'P1',
+        year: p1Year,
+        month: p1Month,
+        cloudMax: p1CloudMax,
+        fillDays: p1FillDays,
+        compositeMethod: p1CompositeMethod,
+        productName: compareProduct,
+        featureName: featureLabel,
+        nImages: p1Scene.nImages,
+        threshold: d1.threshold,
+        featureArea_km2: a1
+      }),
+      ee.Feature(null, {
+        period: 'P2',
+        year: p2Year,
+        month: p2Month,
+        cloudMax: p2CloudMax,
+        fillDays: p2FillDays,
+        compositeMethod: p2CompositeMethod,
+        productName: compareProduct,
+        featureName: featureLabel,
+        nImages: p2Scene.nImages,
+        threshold: d2.threshold,
+        featureArea_km2: a2
+      })
+    ]),
+    description: 'Scene_Compare_Summary_' + compareProduct + '_' + p1Year + '_' + twoDigit(p1Month) + '_vs_' + p2Year + '_' + twoDigit(p2Month),
+    folder: 'GEE_Exports',
+    fileFormat: 'CSV'
+  });
+
+  print('Compare summary CSV task created.');
+}
+
+
+// =====================================================
+// UI PANEL
+// =====================================================
+var panel = ui.Panel({style: {width: '390px', padding: '10px'}});
+
+panel.add(ui.Label({
+  value: 'Any Scene Comparison Tool',
+  style: {fontSize: '16px', fontWeight: 'bold'}
+}));
+
+panel.add(ui.Label({
+  value: 'Draw an AOI, choose product/year/month/cloud/composite/fill window, then build scenes.',
+  style: {fontSize: '11px', color: '#555'}
+}));
+
+panel.add(ui.Label({
+  value: 'Valid Landsat year range: ' + MIN_YEAR + '–' + CURRENT_YEAR + '. Cloud Fill is off by default; larger windows use more scenes.',
+  style: {fontSize: '11px', color: '#555'}
+}));
+
+var statusLabel = ui.Label('No AOI built yet.', {fontSize: '11px', color: '#333'});
+panel.add(statusLabel);
+
+var modeLabel = ui.Label('Mode: waiting for selection.', {fontSize: '11px', color: '#333'});
+panel.add(modeLabel);
+
+var buildBtn = ui.Button({
+  label: 'Build / Refresh Selected Scenes',
+  onClick: buildSelectedScenes
+});
+panel.add(buildBtn);
+
+var clearBtn = ui.Button({
+  label: 'Clear Drawn AOI',
+  onClick: function() {
+    activeRoi = null;
+    p1Scene = null;
+    p2Scene = null;
+    resetDrawingLayer();
+
+    layerAOI.setEeObject(ee.Geometry.Point([0, 0]));
+    layerAOI.setShown(false);
+
+    p1Info.setValue('');
+    p2Info.setValue('');
+    diffInfo.setValue('AOI cleared.');
+    statusLabel.setValue('AOI cleared. Draw a new AOI.');
+  }
+});
+panel.add(clearBtn);
+
+
+// P1 controls
+panel.add(ui.Label('Period 1 Product:'));
+var p1ProductSelect = ui.Select({
+  items: PRODUCT_OPTIONS,
+  value: p1Product,
+  style: {stretch: 'horizontal'},
+  onChange: function(v) {
+    p1Product = v;
+    updateControlState();
+    updateLegends();
+    updateComparison();
+  }
+});
+panel.add(p1ProductSelect);
+
+panel.add(ui.Label('Period 1 Year:'));
+var p1YearBox = ui.Textbox({
+  value: String(p1Year),
+  placeholder: 'e.g., 2024',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p1YearBox);
+
+panel.add(ui.Label('Period 1 Month:'));
+var p1MonthSelect = ui.Select({
+  items: MONTH_OPTIONS,
+  value: '08 - August',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p1MonthSelect);
+
+panel.add(ui.Label('Period 1 Cloud Cover:'));
+var p1CloudSelect = ui.Select({
+  items: CLOUD_OPTIONS,
+  value: '<35%',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p1CloudSelect);
+
+panel.add(ui.Label('Period 1 Composite Method:'));
+var p1CompositeSelect = ui.Select({
+  items: COMPOSITE_METHOD_OPTIONS,
+  value: p1CompositeMethod,
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p1CompositeSelect);
+
+panel.add(ui.Label('Period 1 Cloud Fill Window:'));
+var p1FillSelect = ui.Select({
+  items: CLOUD_FILL_OPTIONS,
+  value: 'Off',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p1FillSelect);
+
+panel.add(ui.Label('P1 Opacity:'));
+var p1OpacitySlider = ui.Slider({
+  min: 0,
+  max: 1,
+  value: 1.0,
+  step: 0.05,
+  onChange: function(v) {
+    layerP1Main.setOpacity(v);
+  }
+});
+panel.add(p1OpacitySlider);
+
+var p1Info = ui.Label('', {fontSize: '11px', color: '#333'});
+panel.add(p1Info);
+
+
+// P2 controls
+panel.add(ui.Label('Period 2 Product:'));
+var p2ProductSelect = ui.Select({
+  items: PRODUCT_OPTIONS,
+  value: p2Product,
+  style: {stretch: 'horizontal'},
+  onChange: function(v) {
+    p2Product = v;
+    updateControlState();
+    updateLegends();
+    updateComparison();
+  }
+});
+panel.add(p2ProductSelect);
+
+panel.add(ui.Label('Period 2 Year:'));
+var p2YearBox = ui.Textbox({
+  value: String(p2Year),
+  placeholder: 'e.g., 2024',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p2YearBox);
+
+panel.add(ui.Label('Period 2 Month:'));
+var p2MonthSelect = ui.Select({
+  items: MONTH_OPTIONS,
+  value: '08 - August',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p2MonthSelect);
+
+panel.add(ui.Label('Period 2 Cloud Cover:'));
+var p2CloudSelect = ui.Select({
+  items: CLOUD_OPTIONS,
+  value: '<35%',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p2CloudSelect);
+
+panel.add(ui.Label('Period 2 Composite Method:'));
+var p2CompositeSelect = ui.Select({
+  items: COMPOSITE_METHOD_OPTIONS,
+  value: p2CompositeMethod,
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p2CompositeSelect);
+
+panel.add(ui.Label('Period 2 Cloud Fill Window:'));
+var p2FillSelect = ui.Select({
+  items: CLOUD_FILL_OPTIONS,
+  value: 'Off',
+  style: {stretch: 'horizontal'},
+  onChange: rebuildIfReady
+});
+panel.add(p2FillSelect);
+
+panel.add(ui.Label('P2 Opacity:'));
+var p2OpacitySlider = ui.Slider({
+  min: 0,
+  max: 1,
+  value: 0.7,
+  step: 0.05,
+  onChange: function(v) {
+    layerP2Main.setOpacity(v);
+  }
+});
+panel.add(p2OpacitySlider);
+
+var p2Info = ui.Label('', {fontSize: '11px', color: '#333'});
+panel.add(p2Info);
+
+
+// Stats
+var statsBtn = ui.Button({
+  label: 'Refresh Compare Stats',
+  onClick: refreshStats
+});
+panel.add(statsBtn);
+
+var diffInfo = ui.Label('', {fontSize: '11px', color: '#333'});
+panel.add(diffInfo);
+
+
+// Raster export
+panel.add(ui.Label('Raster Export:'));
+var rasterExportSelect = ui.Select({
+  items: ['P1 Selected Product', 'P2 Selected Product'],
+  value: 'P1 Selected Product',
+  style: {stretch: 'horizontal'}
+});
+panel.add(rasterExportSelect);
+
+var rasterExportBtn = ui.Button({
+  label: 'Create Raster Export Task',
+  onClick: function() {
+    exportRaster(rasterExportSelect.getValue());
+  }
+});
+panel.add(rasterExportBtn);
+
+
+// Compare export
+panel.add(ui.Label('Compare Export (same analytic product only):'));
+var compareExportSelect = ui.Select({
+  items: [
+    'Selected Analytic Delta (P2 - P1)',
+    'Selected Feature Gain',
+    'Selected Feature Loss',
+    'Selected Feature Net (-1/0/+1)',
+    'P1 Selected Feature',
+    'P2 Selected Feature'
+  ],
+  value: 'Selected Analytic Delta (P2 - P1)',
+  style: {stretch: 'horizontal'}
+});
+panel.add(compareExportSelect);
+
+var compareExportBtn = ui.Button({
+  label: 'Create Compare Export Task',
+  onClick: function() {
+    exportCompare(compareExportSelect.getValue());
+  }
+});
+panel.add(compareExportBtn);
+
+var csvBtn = ui.Button({
+  label: 'Export Compare Summary CSV',
+  onClick: exportCompareSummaryCSV
+});
+panel.add(csvBtn);
+
+ui.root.insert(0, panel);
+
+
+// =====================================================
+// INIT
+// =====================================================
+updateControlState();
+updateLegends();
+
+print('Updated Any Scene script loaded.');
+print('Cloud Fill Window added: Off, ±15 days, ±30 days, ±45 days.');
+print('Resource cap: max ' + MAX_SCENES_PER_COMPOSITE + ' scenes per composite.');
+print('Compare logic preserved: compare tools only activate when P1 and P2 use the same analytic product.');
